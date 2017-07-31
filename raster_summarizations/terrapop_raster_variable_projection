@@ -1,0 +1,38 @@
+CREATE OR REPLACE FUNCTION terrapop_raster_variable_projection(raster_variable_id bigint, raster_bnd bigint) 
+RETURNS TABLE (srid bigint) AS
+
+$BODY$
+
+	DECLARE
+	query := '';
+	data_raster text := '';
+
+	BEGIN
+
+	WITH all_raster_variable_ids AS
+	(
+	select id 
+	from raster_variables
+	)
+
+	SELECT rmw.schema || '.' || rmw.tablename as tablename
+	FROM all_raster_variable_ids a, rasters_metadata_view rmw
+	INTO data_raster
+	WHERE rmw.id = a.id;
+
+	
+	query := $$ 
+	Select ST_SRID(rast)
+	FROM $$ || data_raster || $$ 
+	limit 1
+	$$ ;
+	
+	RAISE NOTICE  ' % ', query;
+	RETURN QUERY execute query;
+	END;
+
+$BODY$
+LANGUAGE plpgsql VOLATILE
+COST 100
+ROWS 1000;
+

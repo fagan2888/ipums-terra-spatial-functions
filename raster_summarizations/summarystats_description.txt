@@ -1,0 +1,115 @@
+This file provides a brief description of the raster summary process
+
+
+This is terrapop_area_reference_summarization function
+
+DECLARE
+
+data_raster text := '';
+query text := '';
+
+BEGIN
+
+-- The following lines get useful information, like SRID from the view raster_metadata_view. You can add more fields to this view, but please do not remove or change their names. They are used in other functions.
+
+SELECT schema || '.' || tablename as tablename
+FROM rasters_metadata_view rmw
+INTO data_raster
+WHERE rmw.id = raster_variable_id;
+
+RAISE NOTICE '%', data_raster;
+
+DROP TABLE IF EXISTS terrapop_area_reference_boundary;
+
+-- Creating a temporary table that will also check to determine if the boundary is valid. Note that projecting a valid boundary can create an invalid boundary.
+query := $$ CREATE TEMP TABLE terrapop_area_reference_boundary AS
+WITH raster_projection AS
+(
+select st_srid(rast) as prj
+from $$ || data_raster || $$ 
+limit 1
+)
+SELECT sgl.id as sample_geog_level_id, gi.id as geog_instance_id, gi.label as geog_instance_label, gi.code as geog_instance_code, ST_Transform(bound.geom, prj.prj) as geom,
+ST_IsValidReason(ST_Transform(bound.geom, prj.prj)) as reason
+FROM raster_projection prj,
+sample_geog_levels sgl
+inner join geog_instances gi on sgl.id = gi.sample_geog_level_id
+inner join boundaries bound on bound.geog_instance_id = gi.id
+WHERE sgl.id = $$ || sample_geog_level_id || $$ $$;
+
+RAISE NOTICE  ' % ', query;
+
+EXECUTE query;
+
+-- Attempt to validate any invalid geometries
+Update terrapop_area_reference_boundary
+SET geom = ST_CollectionExtract(ST_MakeValid(geom),3), reason = ST_IsValidReason(ST_MakeValid(geom))
+WHERE reason <> 'Valid Geometry';
+
+-- Remove from the temporary table any geometries that are bad.
+DELETE FROM terrapop_area_reference_boundary
+WHERE ST_IsValidReason(geom) <> 'Valid Geometry';
+
+-- Pass the temporary table to the summary function.
+RETURN QUERY
+SELECT * FROM _tp_area_reference_summarization('terrapop_area_reference_boundary'::text, raster_variable_id );
+
+
+Lines 44-51 should be wrapped into their own stored procedure, so that if you determine a better way of validating the boundaries all functions can benefit from this.
+
+
+
+This is the underlying function _tp_area_reference_summarization. The most important item is that the raster summarization need to exclude the ST_Union function and utilize the ST_SummaryStatsAgg function. This function completes the processes much faster. Every raster that uses the ST_SummaryStatsAgg function needs to have a No data value set.
+
+DECLARE
+
+area_raster text := '';
+projection integer;	
+query text := '';
+
+BEGIN
+
+SELECT schema || '.' || tablename as tablename
+FROM rasters_metadata_view rmw
+INTO area_raster
+WHERE rmw.id = raster_variable_id;
+
+RAISE NOTICE '%', area_raster;
+
+SELECT srid
+FROM rasters_metadata_view rmw
+INTO projection
+WHERE rmw.id = raster_variable_id;
+
+IF projection = 4326 THEN
+
+    query  := $$  WITH geographic_boundaries as
+    (
+    SELECT sample_geog_level_id, geog_instance_id, geog_instance_label, geog_instance_code, geom
+    FROM $$ || sample_table_name || $$
+    )
+    SELECT p.geog_instance_id as geog_id, p.geog_instance_label::text as place_name, p.geog_instance_code as place_code,  
+    (ST_SummaryStatsAgg(ST_Clip(r.rast, p.geom),1, True)).sum as total_area
+    FROM geographic_boundaries p inner join $$ || area_raster || $$  r on ST_Intersects(r.rast, p.geom)
+    GROUP BY geog_instance_id, geog_instance_label, geog_instance_code $$ ;
+
+    RAISE NOTICE  ' % ', query;
+   
+
+ELSE
+    -- Because the NODataValues are not yet set on the area reference rasters the ST_CLIP thing goes crazy if you try to set the nodata value. There should not be a no datavalue
+    query  := $$  WITH geographic_boundaries as
+    (
+    SELECT sample_geog_level_id, geog_instance_id, geog_instance_label, geog_instance_code, geom
+    FROM $$ || sample_table_name || $$
+    ), grouping as
+    (
+    SELECT p.geog_instance_id as geog_id, p.geog_instance_label::text as place_name, p.geog_instance_code as place_code,  
+    (ST_SummaryStatsAgg(ST_Clip(r.rast, 1, p.geom, 0),1, True)).count as pixel_count
+    FROM geographic_boundaries p inner join $$ || area_raster || $$  r on ST_Intersects(r.rast, p.geom)
+    GROUP BY geog_instance_id, geog_instance_label, geog_instance_code 
+    )
+    SELECT geog_id, place_name, place_code, pixel_count * 214658.671875:: double precision as total_area
+    FROM grouping $$;
+
+    RAISE NOTICE  ' % ', query;
